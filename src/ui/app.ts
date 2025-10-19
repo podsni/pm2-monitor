@@ -14,19 +14,35 @@ interface ActionDefinition {
     confirm?: boolean;
 }
 
-const REFRESH_INTERVAL_MS = 4000;
-const STATS_INTERVAL_MS = 3000;
-const HISTORY_LENGTH = 30;
+const REFRESH_INTERVAL_MS = 2000; // Lebih cepat untuk interaktivitas
+const STATS_INTERVAL_MS = 1500;
+const HISTORY_LENGTH = 60; // Lebih banyak history untuk grafik
+const NOTIFICATION_TIMEOUT = 3000;
 
 const STATUS_STYLES: Record<
     string,
-    { icon: string; color: string; label: string }
+    { icon: string; color: string; label: string; bg?: string }
 > = {
-    online: { icon: "●", color: "green", label: "ONLINE" },
-    stopped: { icon: "○", color: "yellow", label: "STOPPED" },
-    errored: { icon: "✖", color: "red", label: "ERRORED" },
-    stopping: { icon: "■", color: "magenta", label: "STOPPING" },
-    launching: { icon: "▲", color: "cyan", label: "LAUNCHING" },
+    online: { icon: "●", color: "green", label: "ONLINE", bg: "green" },
+    stopped: { icon: "○", color: "yellow", label: "STOPPED", bg: "yellow" },
+    errored: { icon: "✖", color: "red", label: "ERRORED", bg: "red" },
+    stopping: { icon: "■", color: "magenta", label: "STOPPING", bg: "magenta" },
+    launching: {
+        icon: "▲",
+        color: "cyan",
+        label: "LAUNCHING",
+        bg: "cyan",
+    },
+};
+
+const THEMES = {
+    primary: "cyan",
+    success: "green",
+    warning: "yellow",
+    danger: "red",
+    info: "blue",
+    muted: "grey",
+    accent: "magenta",
 };
 
 export class App {
@@ -42,6 +58,9 @@ export class App {
     private readonly insightsBox: Widgets.BoxElement;
     private readonly logBox: any;
     private readonly footer: Widgets.BoxElement;
+    private readonly notificationBox: Widgets.BoxElement;
+    private readonly cpuLineChart: any;
+    private readonly memLineChart: any;
 
     private processes: ManagedProcess[] = [];
     private selectedIndex = 0;
@@ -52,11 +71,21 @@ export class App {
     private statusTimer?: NodeJS.Timeout;
     private cpuHistory: number[] = [];
     private memHistory: number[] = [];
+    private notificationTimer?: NodeJS.Timeout;
+    private animationFrame = 0;
+    private searchMode = false;
+    private searchQuery = "";
+    private filteredProcesses: ManagedProcess[] = [];
+    private viewMode: "all" | "running" | "stopped" = "all";
 
     constructor(private readonly client = new PM2Client()) {
         this.screen = blessed.screen({
             smartCSR: true,
-            title: "pm2x • Interactive Process Manager",
+            title: "🚀 PM2X • Interactive Process Manager",
+            fullUnicode: true,
+            dockBorders: true,
+            mouse: true,
+            sendFocus: true,
         });
 
         this.screen.key(["q", "C-c"], () => this.shutdown());
@@ -64,71 +93,189 @@ export class App {
             this.screen.render();
         });
 
+        // Enable mouse wheel scrolling globally
+        this.screen.enableMouse();
+
+        // Grid dengan layout yang lebih modern
         this.grid = new contrib.grid({
-            rows: 12,
+            rows: 16,
             cols: 12,
             screen: this.screen,
         });
 
+        // Header dengan gradient effect
         this.headerBox = this.grid.set(0, 0, 2, 12, blessed.box, {
             tags: true,
-            padding: { top: 0, left: 1 },
-            style: { fg: "white", bg: "blue" },
+            padding: { top: 0, left: 1, right: 1 },
+            style: {
+                fg: "white",
+                bg: "blue",
+                bold: true,
+            },
         });
 
-        this.summaryBox = this.grid.set(2, 0, 2, 8, blessed.box, {
-            label: "Cluster Overview",
+        // Notification box (hidden by default)
+        this.notificationBox = blessed.box({
+            top: "center",
+            left: "center",
+            width: "50%",
+            height: 5,
             tags: true,
-            border: { type: "line", fg: "cyan" },
-            style: { bg: "", fg: "white" },
+            border: {
+                type: "line",
+            },
+            style: {
+                fg: "white",
+                bg: "black",
+                border: { fg: THEMES.primary },
+            },
+            padding: 1,
+            hidden: true,
         });
+        this.screen.append(this.notificationBox);
 
-        this.actionsBox = this.grid.set(2, 8, 2, 4, blessed.box, {
-            label: "Quick Actions",
+        // Summary dengan warna yang lebih menarik
+        this.summaryBox = this.grid.set(2, 0, 3, 6, blessed.box, {
+            label: " 📊 Cluster Overview ",
             tags: true,
-            border: { type: "line", fg: "cyan" },
-            style: { fg: "white" },
+            border: { type: "line", fg: THEMES.primary },
+            style: {
+                bg: "",
+                fg: "white",
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: { left: 1, right: 1 },
+            mouse: true,
+            scrollable: true,
         });
 
-        this.processTable = this.grid.set(4, 0, 5, 7, contrib.table, {
+        // CPU Chart - use simple box instead of line chart for compatibility
+        this.cpuLineChart = this.grid.set(2, 6, 3, 3, blessed.box, {
+            label: " 📈 CPU Usage ",
+            tags: true,
+            border: { type: "line" },
+            style: {
+                fg: "white",
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: { left: 1 },
+        });
+
+        // Memory Chart - use simple box instead of line chart for compatibility
+        this.memLineChart = this.grid.set(2, 9, 3, 3, blessed.box, {
+            label: " 💾 Memory Usage ",
+            tags: true,
+            border: { type: "line" },
+            style: {
+                fg: "white",
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: { left: 1 },
+        });
+
+        // Actions dengan style lebih menarik
+        this.actionsBox = this.grid.set(5, 0, 3, 4, blessed.box, {
+            label: " ⚡ Quick Actions ",
+            tags: true,
+            border: { type: "line", fg: THEMES.primary },
+            style: {
+                fg: "white",
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: { left: 1 },
+            mouse: true,
+            scrollable: true,
+        });
+
+        // Process table dengan kolom yang lebih baik
+        this.processTable = this.grid.set(5, 4, 6, 8, contrib.table, {
             keys: true,
             fg: "white",
             selectedFg: "black",
-            selectedBg: "green",
+            selectedBg: THEMES.success,
             interactive: true,
-            label: "Processes",
-            columnWidth: [26, 12, 12, 16, 18, 12, 10],
+            label: " 🔄 Processes ",
+            columnWidth: [4, 20, 10, 10, 12, 10, 10, 10],
+            columnSpacing: 1,
+            style: {
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+                header: { fg: THEMES.info, bold: true },
+            },
+            mouse: true,
+            vi: true,
         });
 
-        this.detailBox = this.grid.set(4, 7, 3, 5, blessed.box, {
-            label: "Selected Process",
+        // Detail panel
+        this.detailBox = this.grid.set(8, 0, 3, 4, blessed.box, {
+            label: " 🔍 Process Details ",
             tags: true,
-            border: { type: "line", fg: "cyan" },
+            border: { type: "line", fg: THEMES.primary },
+            style: {
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: { left: 1 },
+            scrollable: true,
+            mouse: true,
         });
 
-        this.statsBox = this.grid.set(7, 7, 2, 5, blessed.box, {
-            label: "Host Metrics",
+        // Stats box
+        this.statsBox = this.grid.set(11, 0, 2, 4, blessed.box, {
+            label: " 💻 System Stats ",
             tags: true,
-            border: { type: "line", fg: "cyan" },
+            border: { type: "line", fg: THEMES.primary },
+            style: {
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: { left: 1 },
+            mouse: true,
         });
 
-        this.insightsBox = this.grid.set(9, 7, 2, 5, blessed.box, {
-            label: "Insights",
+        // Insights dengan tips
+        this.insightsBox = this.grid.set(13, 0, 2, 4, blessed.box, {
+            label: " 💡 Insights ",
             tags: true,
-            border: { type: "line", fg: "cyan" },
-            style: { fg: "white" },
+            border: { type: "line", fg: THEMES.primary },
+            style: {
+                fg: "white",
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: { left: 1 },
+            mouse: true,
+            scrollable: true,
         });
 
-        this.logBox = this.grid.set(9, 0, 2, 7, contrib.log, {
+        // Logs dengan warna syntax
+        this.logBox = this.grid.set(11, 4, 4, 8, contrib.log, {
             fg: "white",
-            selectedFg: "green",
-            label: "Live Logs",
+            selectedFg: THEMES.success,
+            label: " 📝 Live Logs ",
             tags: true,
+            style: {
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            scrollable: true,
+            mouse: true,
         });
 
-        this.footer = this.grid.set(11, 0, 1, 12, blessed.box, {
+        // Footer dengan lebih banyak shortcuts
+        this.footer = this.grid.set(15, 0, 1, 12, blessed.box, {
             tags: true,
-            border: { type: "line", fg: "cyan" },
+            border: { type: "line", fg: THEMES.primary },
+            style: {
+                fg: "white",
+                border: { fg: THEMES.primary },
+            },
+            padding: { left: 1, right: 1 },
+            mouse: true,
         });
 
         this.registerKeybindings();
@@ -137,13 +284,17 @@ export class App {
     }
 
     async start(): Promise<void> {
+        this.showNotification("🚀 Connecting to PM2...", "info");
         try {
             await this.client.ensureConnected();
+            this.showNotification(
+                "✅ Connected to PM2 successfully!",
+                "success",
+            );
         } catch (error) {
-            this.flashError(
-                `Unable to connect to PM2. Ensure PM2 is installed and running.\n${String(
-                    error,
-                )}`,
+            this.showNotification(
+                `❌ Unable to connect to PM2\n${String(error)}`,
+                "error",
             );
             return;
         }
@@ -153,10 +304,12 @@ export class App {
         this.startAutoRefresh();
         this.startMetricsLoop();
         this.updateFooter();
+        this.startAnimation();
         this.screen.render();
     }
 
     async shutdown(): Promise<void> {
+        this.showNotification("👋 Shutting down...", "info");
         this.stopAutoRefresh();
         if (this.unsubscribeLogs) {
             this.unsubscribeLogs();
@@ -179,169 +332,378 @@ export class App {
             });
         }
 
+        // Mouse click support for process table
+        this.processTable.on("click", () => {
+            this.processTable.focus();
+        });
+
+        // Mouse wheel support for scrolling
+        this.processTable.on("wheeldown", () => {
+            this.changeSelection(1);
+        });
+
+        this.processTable.on("wheelup", () => {
+            this.changeSelection(-1);
+        });
+
+        // Double click to open action menu
+        this.processTable.on("element click", (_el: any, _data: any) => {
+            const proc = this.getSelectedProcess();
+            if (proc) {
+                this.openActionMenu();
+            }
+        });
+
+        // Make detail box scrollable with mouse
+        this.detailBox.on("wheeldown", () => {
+            this.detailBox.scroll(1);
+            this.screen.render();
+        });
+
+        this.detailBox.on("wheelup", () => {
+            this.detailBox.scroll(-1);
+            this.screen.render();
+        });
+
+        // Make log box scrollable with mouse
+        this.logBox.on("wheeldown", () => {
+            this.logBox.scroll(1);
+            this.screen.render();
+        });
+
+        this.logBox.on("wheelup", () => {
+            this.logBox.scroll(-1);
+            this.screen.render();
+        });
+
+        // Make insights scrollable with mouse
+        this.insightsBox.on("wheeldown", () => {
+            this.insightsBox.scroll(1);
+            this.screen.render();
+        });
+
+        this.insightsBox.on("wheelup", () => {
+            this.insightsBox.scroll(-1);
+            this.screen.render();
+        });
+
+        // Navigation
         this.screen.key(["up", "k"], () => this.changeSelection(-1));
         this.screen.key(["down", "j"], () => this.changeSelection(1));
+        this.screen.key(["g"], () => this.jumpToFirst());
+        this.screen.key(["G"], () => this.jumpToLast());
+        this.screen.key(["pageup"], () => this.changeSelection(-10));
+        this.screen.key(["pagedown"], () => this.changeSelection(10));
 
+        // Actions
         this.screen.key(["s"], () =>
-            this.wrapAction("Starting all", () => this.client.startAll()),
+            this.wrapAction("🚀 Starting all processes", () =>
+                this.client.startAll(),
+            ),
         );
         this.screen.key(["r"], () =>
-            this.wrapAction("Restarting all", () => this.client.restartAll()),
+            this.wrapAction("🔄 Restarting all processes", () =>
+                this.client.restartAll(),
+            ),
         );
         this.screen.key(["x"], () =>
-            this.wrapAction("Stopping all", () => this.client.stopAll()),
+            this.wrapAction("⏹️  Stopping all processes", () =>
+                this.client.stopAll(),
+            ),
         );
         this.screen.key(["S"], () =>
-            this.wrapAction("Reloading all", () => this.client.reloadAll()),
+            this.wrapAction("♻️  Reloading all processes", () =>
+                this.client.reloadAll(),
+            ),
         );
+        this.screen.key(["d"], async () => {
+            const confirmed = await this.confirm(
+                "Delete ALL processes? This cannot be undone!",
+            );
+            if (confirmed) {
+                await this.wrapAction(
+                    "🗑️  Deleting all processes",
+                    async () => {
+                        const procs = await this.client.listProcesses();
+                        for (const proc of procs) {
+                            await this.client.deleteProcess(proc.pmId);
+                        }
+                    },
+                );
+            }
+        });
+
+        // Individual process actions
+        this.screen.key(["enter", "a"], () => this.openActionMenu());
         this.screen.key(["l"], () => this.toggleLogsForSelected());
+
+        // View modes
+        this.screen.key(["1"], () => this.setViewMode("all"));
+        this.screen.key(["2"], () => this.setViewMode("running"));
+        this.screen.key(["3"], () => this.setViewMode("stopped"));
+
+        // Pause/Resume
         this.screen.key([" "], () => {
             this.paused = !this.paused;
             if (this.paused) {
                 this.stopAutoRefresh();
-                this.flashInfo("Auto refresh paused");
+                this.showNotification("⏸️  Monitoring paused", "warning");
             } else {
                 this.startAutoRefresh();
-                void this.refreshProcesses(true);
-                this.flashInfo("Auto refresh resumed");
+                this.showNotification("▶️  Monitoring resumed", "success");
             }
-            this.updateSummary();
-            this.updateHeader();
-            this.updateActions();
             this.updateFooter();
+            this.screen.render();
         });
-        this.screen.key(["enter"], () => this.openActionMenu());
-        this.screen.key(["?"], () => this.openHelpOverlay());
+
+        // Refresh
+        this.screen.key(["f5", "R"], () => {
+            this.showNotification("🔄 Refreshing...", "info");
+            this.refreshProcesses(true);
+        });
+
+        // Search
+        this.screen.key(["/"], () => this.startSearch());
+        this.screen.key(["escape"], () => this.cancelSearch());
+
+        // Help
+        this.screen.key(["?", "h"], () => this.openHelpOverlay());
     }
 
-    private async refreshProcesses(forceRender = false): Promise<void> {
-        try {
-            const processes = await this.client.listProcesses();
-            this.processes = processes.sort((a, b) =>
-                a.name.localeCompare(b.name),
+    private startSearch(): void {
+        this.searchMode = true;
+        this.searchQuery = "";
+        this.updateFooter();
+        this.screen.render();
+
+        // Simple search implementation
+        const searchBox = blessed.textbox({
+            parent: this.screen,
+            top: "center",
+            left: "center",
+            width: "50%",
+            height: 3,
+            label: " 🔍 Search Process ",
+            border: { type: "line" },
+            style: {
+                fg: "white",
+                bg: "black",
+                border: { fg: THEMES.primary },
+            },
+            inputOnFocus: true,
+        });
+
+        searchBox.on("submit", (value: string) => {
+            this.searchQuery = value;
+            this.applyFilter();
+            searchBox.destroy();
+            this.searchMode = false;
+            this.updateFooter();
+            this.screen.render();
+        });
+
+        searchBox.on("cancel", () => {
+            searchBox.destroy();
+            this.searchMode = false;
+            this.updateFooter();
+            this.screen.render();
+        });
+
+        this.screen.render();
+        searchBox.focus();
+        searchBox.readInput();
+    }
+
+    private cancelSearch(): void {
+        this.searchMode = false;
+        this.searchQuery = "";
+        this.applyFilter();
+        this.updateFooter();
+        this.screen.render();
+    }
+
+    private applyFilter(): void {
+        let filtered = this.processes;
+
+        // Apply view mode filter
+        if (this.viewMode === "running") {
+            filtered = filtered.filter((p) => p.status === "online");
+        } else if (this.viewMode === "stopped") {
+            filtered = filtered.filter((p) => p.status !== "online");
+        }
+
+        // Apply search filter
+        if (this.searchQuery) {
+            const query = this.searchQuery.toLowerCase();
+            filtered = filtered.filter(
+                (p) =>
+                    p.name.toLowerCase().includes(query) ||
+                    p.namespace?.toLowerCase().includes(query) ||
+                    p.status.toLowerCase().includes(query),
             );
+        }
+
+        this.filteredProcesses = filtered;
+        this.renderProcessTable();
+    }
+
+    private setViewMode(mode: "all" | "running" | "stopped"): void {
+        this.viewMode = mode;
+        this.applyFilter();
+        const modeLabels = {
+            all: "📋 All Processes",
+            running: "✅ Running Only",
+            stopped: "⏹️  Stopped Only",
+        };
+        this.showNotification(`View: ${modeLabels[mode]}`, "info");
+        this.screen.render();
+    }
+
+    private jumpToFirst(): void {
+        this.selectedIndex = 0;
+        this.afterSelectionChange();
+        this.screen.render();
+    }
+
+    private jumpToLast(): void {
+        const procs = this.searchQuery
+            ? this.filteredProcesses
+            : this.processes;
+        this.selectedIndex = Math.max(0, procs.length - 1);
+        this.afterSelectionChange();
+        this.screen.render();
+    }
+
+    private startAnimation(): void {
+        setInterval(() => {
+            this.animationFrame = (this.animationFrame + 1) % 4;
+            this.updateHeader();
+            this.screen.render();
+        }, 250);
+    }
+
+    private showNotification(
+        message: string,
+        type: "info" | "success" | "warning" | "error",
+    ): void {
+        const icons = {
+            info: "ℹ️",
+            success: "✅",
+            warning: "⚠️",
+            error: "❌",
+        };
+        const colors = {
+            info: THEMES.info,
+            success: THEMES.success,
+            warning: THEMES.warning,
+            error: THEMES.danger,
+        };
+
+        if (this.notificationTimer) {
+            clearTimeout(this.notificationTimer);
+        }
+
+        this.notificationBox.setContent(
+            `{center}{bold}{${colors[type]}-fg}${icons[type]} ${message}{/${colors[type]}-fg}{/bold}{/center}`,
+        );
+        this.notificationBox.style.border.fg = colors[type];
+        this.notificationBox.show();
+        this.screen.render();
+
+        this.notificationTimer = setTimeout(() => {
+            this.notificationBox.hide();
+            this.screen.render();
+        }, NOTIFICATION_TIMEOUT);
+    }
+
+    private async refreshProcesses(force = false): Promise<void> {
+        if (this.paused && !force) return;
+
+        try {
+            this.processes = await this.client.listProcesses();
+            this.applyFilter();
             this.renderProcessTable();
             this.updateSummary();
             this.updateDetailPanel();
             this.updateInsights();
-            this.updateActions();
-            this.updateHeader();
-            if (forceRender) {
-                this.screen.render();
-            }
+            this.screen.render();
         } catch (error) {
-            this.flashError(`Failed to refresh processes: ${String(error)}`);
+            this.showNotification(
+                `Error refreshing: ${String(error)}`,
+                "error",
+            );
         }
     }
 
     private renderProcessTable(): void {
-        const headers = [
-            "Process",
-            "State",
-            "Namespace",
-            "CPU",
-            "Memory",
-            "Uptime",
-            "Restarts",
-        ];
-        const data = this.processes.map((proc) => {
-            const cpuValue = proc.cpu ?? 0;
-            let cpuText = formatCpu(proc.cpu);
-            if (proc.cpu !== undefined) {
-                if (proc.cpu >= 80) cpuText = chalk.red(cpuText);
-                else if (proc.cpu >= 50) cpuText = chalk.yellow(cpuText);
-                else cpuText = chalk.green(cpuText);
-            }
-            const cpuCell =
-                proc.cpu === undefined
-                    ? "-"
-                    : `${cpuText} ${this.renderMiniBar(cpuValue, 100, 6)}`;
+        const procs = this.searchQuery
+            ? this.filteredProcesses
+            : this.processes;
 
-            const memMb = proc.memory ? proc.memory / (1024 * 1024) : undefined;
-            let memText = formatBytes(proc.memory);
-            if (memMb !== undefined) {
-                if (memMb >= 700) memText = chalk.red(memText);
-                else if (memMb >= 400) memText = chalk.yellow(memText);
-                else memText = chalk.cyan(memText);
-            }
-            const memoryCell =
-                memMb === undefined
-                    ? "-"
-                    : `${memText} ${this.renderMiniBar(memMb, 1024, 6)}`;
-
-            const restarts = proc.restarts ?? 0;
-            let restartCell = restarts.toString();
-            if (restarts >= 5) restartCell = chalk.red(restartCell);
-            else if (restarts >= 1) restartCell = chalk.yellow(restartCell);
-
-            let uptimeCell = formatUptime(proc.uptime);
-            if (proc.uptime !== undefined) {
-                if (proc.uptime < 5 * 60 * 1000 && proc.status === "online") {
-                    uptimeCell = chalk.yellow(uptimeCell);
-                } else if (proc.status === "online") {
-                    uptimeCell = chalk.green(uptimeCell);
-                }
-            }
+        const data = procs.map((p, idx) => {
+            const style = STATUS_STYLES[p.status] || STATUS_STYLES.stopped;
+            const isSelected = idx === this.selectedIndex;
 
             return [
-                this.decorateStatus(proc.status, proc.name),
-                this.formatStatusBadge(proc.status),
-                this.decorateNamespace(proc.namespace),
-                cpuCell,
-                memoryCell,
-                uptimeCell,
-                restartCell,
+                String(p.pmId),
+                this.decorateName(p.name, isSelected),
+                this.formatStatusBadge(p.status),
+                this.decorateNamespace(p.namespace || "-"),
+                formatUptime(p.uptime),
+                formatCpu(p.cpu),
+                formatBytes(p.memory),
+                String(p.restarts),
             ];
         });
 
-        this.processTable.setData({ headers, data });
-
-        if (data.length === 0) {
-            this.selectedIndex = 0;
-        } else {
-            this.selectedIndex = Math.min(this.selectedIndex, data.length - 1);
-            if (
-                this.processTable.rows &&
-                typeof this.processTable.rows.select === "function"
-            ) {
-                this.processTable.rows.select(this.selectedIndex);
-            }
-        }
+        this.processTable.setData({
+            headers: [
+                "ID",
+                "Name",
+                "Status",
+                "Namespace",
+                "Uptime",
+                "CPU",
+                "Memory",
+                "Restarts",
+            ],
+            data,
+        });
     }
 
-    private decorateStatus(status: string, name: string): string {
-        const style = STATUS_STYLES[status] ?? {
-            icon: "•",
-            color: "white",
-            label: status.toUpperCase(),
-        };
-        const colorize = getColor(style.color);
-        return colorize(`${style.icon} ${name}`);
+    private decorateName(name: string, isSelected: boolean): string {
+        if (isSelected) {
+            return `{bold}{${THEMES.accent}-fg}▶ ${name}{/${THEMES.accent}-fg}{/bold}`;
+        }
+        return name;
     }
 
-    private decorateNamespace(namespace?: string): string {
-        if (!namespace || namespace === "default") {
-            return chalk.gray("default");
+    private decorateStatus(status: string): string {
+        const s = STATUS_STYLES[status];
+        if (!s) return status;
+        const colorFn = (chalk as any)[s.color];
+        if (typeof colorFn === "function") {
+            return colorFn(s.label);
         }
-        return chalk.cyan(namespace);
+        return s.label;
+    }
+
+    private decorateNamespace(ns: string): string {
+        return `{${THEMES.muted}-fg}${ns}{/${THEMES.muted}-fg}`;
     }
 
     private formatStatusBadge(status: string): string {
-        const style = STATUS_STYLES[status] ?? {
-            icon: "•",
-            color: "white",
-            label: status.toUpperCase(),
-        };
-        const colorize = getColor(style.color);
-        return colorize(`${style.icon} ${style.label}`);
+        const s = STATUS_STYLES[status];
+        const color = s?.color || "white";
+        const icon = s?.icon || "•";
+        const label = s?.label || status.toUpperCase();
+        return `{${color}-fg}${icon} ${label}{/${color}-fg}`;
     }
 
     private startAutoRefresh(): void {
-        if (this.refreshTimer) return;
+        this.stopAutoRefresh();
         this.refreshTimer = setInterval(() => {
-            if (!this.paused) {
-                void this.refreshProcesses();
-            }
+            void this.refreshProcesses();
         }, REFRESH_INTERVAL_MS);
     }
 
@@ -355,32 +717,38 @@ export class App {
     private async subscribeToLogs(): Promise<void> {
         this.unsubscribeLogs = await this.client.launchBus(
             (message, proc) => {
-                if (this.isSelectedProcess(proc.pm_id ?? -1, proc.name ?? "")) {
-                    this.appendLog("out", proc.name ?? "?", message);
+                const pmId = proc.pm_id ?? -1;
+                if (this.isSelectedProcess(pmId)) {
+                    const name = proc.name ?? "unknown";
+                    this.appendLog(name, message, false);
                 }
             },
             (message, proc) => {
-                if (this.isSelectedProcess(proc.pm_id ?? -1, proc.name ?? "")) {
-                    this.appendLog("err", proc.name ?? "?", message);
+                const pmId = proc.pm_id ?? -1;
+                if (this.isSelectedProcess(pmId)) {
+                    const name = proc.name ?? "unknown";
+                    this.appendLog(name, message, true);
                 }
             },
         );
     }
 
     private appendLog(
-        stream: "out" | "err",
-        name: string,
-        message: string,
+        processName: string,
+        data: string,
+        isError: boolean,
     ): void {
-        const prefix = stream === "out" ? chalk.gray("OUT") : chalk.red("ERR");
-        this.logBox.log(`${prefix} ${chalk.bold(name)} ${message.trim()}`);
-        this.screen.render();
+        const timestamp = new Date().toLocaleTimeString();
+        const color = isError ? THEMES.danger : THEMES.muted;
+        const prefix = isError ? "ERR" : "OUT";
+        this.logBox.log(
+            `{${THEMES.muted}-fg}[${timestamp}]{/${THEMES.muted}-fg} {${color}-fg}[${prefix}]{/${color}-fg} {bold}${processName}{/bold}: ${data}`,
+        );
     }
 
-    private isSelectedProcess(pmId: number, name: string): boolean {
-        const proc = this.processes[this.selectedIndex];
-        if (!proc) return false;
-        return proc.pmId === pmId || proc.name === name;
+    private isSelectedProcess(pmId: number): boolean {
+        const proc = this.getSelectedProcess();
+        return proc?.pmId === pmId;
     }
 
     private async startMetricsLoop(): Promise<void> {
@@ -392,582 +760,78 @@ export class App {
 
     private async updateMetrics(): Promise<void> {
         try {
-            const [load, memory] = await Promise.all([
+            const [cpuLoad, mem] = await Promise.all([
                 si.currentLoad(),
                 si.mem(),
             ]);
-            const cpu = Number(load.currentLoad.toFixed(1));
-            const memUsed = memory.active ?? memory.used;
-            const memPercent = Number(
-                ((memUsed / memory.total) * 100).toFixed(1),
-            );
-            const loadAverages = load as unknown as {
-                avgLoad?: number;
-                avgload?: number;
-            };
-            const loadAvg = loadAverages.avgLoad ?? loadAverages.avgload ?? 0;
-            this.trackHistory(this.cpuHistory, cpu);
-            this.trackHistory(this.memHistory, memPercent);
 
-            const cpuBar = this.renderBar(cpu);
-            const memBar = this.renderBar(memPercent);
-            const cpuTrend = this.renderTrend(this.cpuHistory);
-            const memTrend = this.renderTrend(this.memHistory);
+            const cpuPercent = Math.round(cpuLoad.currentLoad);
+            const memPercent = Math.round((mem.used / mem.total) * 100);
 
-            const content = [
-                `{cyan-fg}CPU{/cyan-fg}  ${cpu.toFixed(1)}%  ${cpuBar}`,
-                `Trend ${cpuTrend}`,
-                `{magenta-fg}MEM{/magenta-fg}  ${formatBytes(memUsed)} / ${formatBytes(
-                    memory.total,
-                )}  (${memPercent.toFixed(1)}%)  ${memBar}`,
-                `Trend ${memTrend}`,
-                `{white-fg}Load Avg{/white-fg}  ${loadAvg.toFixed(2)}  |  Procs ${
-                    this.processes.length
-                }`,
-            ].join("\n");
-            this.statsBox.setContent(content);
+            this.trackHistory(cpuPercent, memPercent);
+            this.updateCharts();
+            this.updateStatsBox(cpuPercent, memPercent, mem);
             this.screen.render();
         } catch (error) {
-            this.statsBox.setContent(`Metrics unavailable\n${String(error)}`);
-            this.screen.render();
+            // Silent fail for metrics
         }
     }
 
-    private trackHistory(history: number[], value: number): void {
-        history.push(value);
-        if (history.length > HISTORY_LENGTH) {
-            history.shift();
+    private trackHistory(cpu: number, mem: number): void {
+        this.cpuHistory.push(cpu);
+        this.memHistory.push(mem);
+        if (this.cpuHistory.length > HISTORY_LENGTH) {
+            this.cpuHistory.shift();
+            this.memHistory.shift();
         }
     }
 
-    private toggleLogsForSelected(): void {
-        const name = this.processes[this.selectedIndex]?.name ?? "—";
-        this.logBox.setLabel(`Live Logs • ${name}`);
-        this.logBox.setContent("");
-        this.screen.render();
-    }
+    private updateCharts(): void {
+        // Simple text-based charts for better compatibility
+        const cpuAvg =
+            this.cpuHistory.length > 0
+                ? Math.round(
+                      this.cpuHistory.reduce((a, b) => a + b, 0) /
+                          this.cpuHistory.length,
+                  )
+                : 0;
+        const memAvg =
+            this.memHistory.length > 0
+                ? Math.round(
+                      this.memHistory.reduce((a, b) => a + b, 0) /
+                          this.memHistory.length,
+                  )
+                : 0;
 
-    private getSelectedProcess(): ManagedProcess | undefined {
-        return this.processes[this.selectedIndex];
-    }
+        const cpuTrend = this.renderTrend(this.cpuHistory);
+        const memTrend = this.renderTrend(this.memHistory);
 
-    private openActionMenu(): void {
-        const proc = this.getSelectedProcess();
-        if (!proc) {
-            this.flashInfo("No process selected");
-            return;
-        }
-        const resolveName = (p: ManagedProcess) =>
-            p.name && p.name !== "unknown" ? p.name : String(p.pmId);
-        const resolveId = (p: ManagedProcess) =>
-            Number.isFinite(p.pmId) && p.pmId >= 0 ? p.pmId : resolveName(p);
-        const actions: ActionDefinition[] = [
-            {
-                label: "Start",
-                handler: (p) => this.client.startProcess(resolveName(p)),
-            },
-            {
-                label: "Stop",
-                handler: (p) => this.client.stopProcess(resolveId(p)),
-            },
-            {
-                label: "Restart",
-                handler: (p) => this.client.restartProcess(resolveId(p)),
-            },
-            {
-                label: "Reload",
-                handler: (p) => this.client.reloadProcess(resolveId(p)),
-            },
-            {
-                label: "Delete",
-                handler: (p) => this.client.deleteProcess(resolveId(p)),
-                confirm: true,
-            },
-        ];
+        const cpuBar = this.renderBar(cpuAvg, 30, THEMES.success);
+        const memBar = this.renderBar(memAvg, 30, THEMES.info);
 
-        const overlay = blessed.list({
-            parent: this.screen,
-            width: "30%",
-            height: "50%",
-            top: "center",
-            left: "center",
-            label: `Actions • ${proc.name}`,
-            border: "line",
-            keys: true,
-            mouse: true,
-            items: actions.map((action) => action.label),
-            style: {
-                selected: {
-                    bg: "green",
-                    fg: "black",
-                },
-            },
-        });
-
-        overlay.focus();
-        overlay.on("select", async (_item: unknown, index: number) => {
-            const action = actions[index];
-            if (!action) return;
-            if (action.confirm) {
-                const confirmed = await this.confirm(
-                    `${action.label} ${proc.name}? This cannot be undone.`,
-                );
-                if (!confirmed) {
-                    this.screen.remove(overlay);
-                    this.processTable.focus();
-                    this.screen.render();
-                    return;
-                }
-            }
-            await this.wrapAction(`${action.label} ${proc.name}`, () =>
-                action.handler(proc),
-            );
-            this.screen.remove(overlay);
-            this.processTable.focus();
-            void this.refreshProcesses(true);
-        });
-
-        overlay.key(["escape", "q"], () => {
-            this.screen.remove(overlay);
-            this.processTable.focus();
-            this.screen.render();
-        });
-
-        this.screen.render();
-    }
-
-    private async confirm(message: string): Promise<boolean> {
-        return new Promise((resolve) => {
-            const box = blessed.box({
-                parent: this.screen,
-                width: "50%",
-                height: "30%",
-                top: "center",
-                left: "center",
-                label: "Confirm",
-                border: "line",
-                content: `${message}\n\nPress {green-fg}y{/green-fg} to confirm or any other key to cancel.`,
-                tags: true,
-                keys: true,
-            });
-            const cleanup = (result: boolean) => {
-                this.screen.remove(box);
-                this.processTable.focus();
-                this.screen.render();
-                resolve(result);
-            };
-            box.key(["y", "Y"], () => cleanup(true));
-            box.key(["n", "N", "escape", "q", "enter"], () => cleanup(false));
-            box.on("blur", () => cleanup(false));
-            box.focus();
-            this.screen.render();
-        });
-    }
-
-    private async wrapAction(
-        label: string,
-        fn: () => Promise<void>,
-    ): Promise<void> {
-        try {
-            this.flashInfo(`${label}…`);
-            await fn();
-            this.flashInfo(`${label} ✓`);
-            void this.refreshProcesses(true);
-        } catch (error) {
-            this.flashError(`${label} failed: ${String(error)}`);
-        }
-    }
-
-    private flashInfo(message: string): void {
-        this.showStatusMessage(message, "green");
-    }
-
-    private flashError(message: string): void {
-        this.showStatusMessage(message, "red");
-    }
-
-    private showStatusMessage(message: string, color: string): void {
-        const statusLine = `{${color}-fg}${message}{/${color}-fg}`;
-        this.footer.setContent(`${statusLine}\n${this.baseFooterContent()}`);
-        this.screen.render();
-        if (this.statusTimer) clearTimeout(this.statusTimer);
-        this.statusTimer = setTimeout(() => this.updateFooter(), 3000);
-    }
-
-    private baseFooterContent(): string {
-        return `↑↓ Navigate  Enter Actions  s Start all  r Restart all  x Stop all  S Reload all  l Clear logs  Space ${
-            this.paused ? "Resume" : "Pause"
-        }  ? Help  q Quit`;
-    }
-
-    private updateFooter(): void {
-        this.footer.setContent(this.baseFooterContent());
-        this.screen.render();
-    }
-
-    private changeSelection(offset: number): void {
-        if (this.processes.length === 0) return;
-        this.selectedIndex = Math.min(
-            Math.max(this.selectedIndex + offset, 0),
-            this.processes.length - 1,
-        );
-        if (
-            this.processTable.rows &&
-            typeof this.processTable.rows.select === "function"
-        ) {
-            this.processTable.rows.select(this.selectedIndex);
-        }
-        this.afterSelectionChange();
-        this.updateActions();
-    }
-
-    private afterSelectionChange(): void {
-        const name = this.processes[this.selectedIndex]?.name ?? "—";
-        this.logBox.setLabel(`Live Logs • ${name}`);
-        this.updateDetailPanel();
-        this.updateInsights();
-        this.screen.render();
-    }
-
-    private updateSummary(): void {
-        const total = this.processes.length;
-        const counters = {
-            online: 0,
-            stopped: 0,
-            errored: 0,
-            other: 0,
-        };
-        for (const proc of this.processes) {
-            if (proc.status === "online") counters.online += 1;
-            else if (proc.status === "stopped") counters.stopped += 1;
-            else if (proc.status === "errored") counters.errored += 1;
-            else counters.other += 1;
-        }
-        const mode = this.paused
-            ? "{red-fg}PAUSED{/red-fg}"
-            : "{green-fg}LIVE{/green-fg}";
-
-        const topCpu = this.processes
-            .filter((proc) => proc.cpu !== undefined)
-            .sort((a, b) => (b.cpu ?? 0) - (a.cpu ?? 0))[0];
-        const topMem = this.processes
-            .filter((proc) => proc.memory !== undefined)
-            .sort((a, b) => (b.memory ?? 0) - (a.memory ?? 0))[0];
-        const topRestarts = this.processes
-            .filter((proc) => (proc.restarts ?? 0) > 0)
-            .sort((a, b) => (b.restarts ?? 0) - (a.restarts ?? 0))[0];
-
-        const cpuHotspot = topCpu
-            ? `{cyan-fg}${topCpu.name}{/cyan-fg} ${formatCpu(topCpu.cpu)}`
-            : "—";
-        const memValueMb = topMem?.memory
-            ? topMem.memory / (1024 * 1024)
-            : undefined;
-        const memColor = memValueMb && memValueMb > 700 ? "red" : "magenta";
-        const memHotspot = topMem
-            ? `{${memColor}-fg}${topMem.name}{/${memColor}-fg} ${formatBytes(
-                  topMem.memory,
-              )}`
-            : "—";
-        const restartHotspot = topRestarts
-            ? `{magenta-fg}${topRestarts.name}{/magenta-fg} ${
-                  topRestarts.restarts
-              }`
-            : "0";
-
-        const headerLine = formatRow(
+        this.cpuLineChart.setContent(
             [
-                `{bold}${total} process${total === 1 ? "" : "es"}{/bold}`,
-                `Mode ${mode}`,
-                `Updated ${new Date().toLocaleTimeString()}`,
-            ],
-            [24, 16, 20],
+                `{bold}Average:{/bold} ${cpuAvg}%`,
+                cpuBar,
+                `{${THEMES.muted}-fg}Trend: ${cpuTrend}{/${THEMES.muted}-fg}`,
+            ].join("\n"),
         );
 
-        const statusLine = formatRow(
+        this.memLineChart.setContent(
             [
-                `{green-fg}● Online{/green-fg} ${padNumber(counters.online)}`,
-                `{yellow-fg}○ Stopped{/yellow-fg} ${padNumber(counters.stopped)}`,
-                `{red-fg}✖ Errored{/red-fg} ${padNumber(counters.errored)}`,
-                counters.other
-                    ? `{magenta-fg}▲ Other{/magenta-fg} ${padNumber(counters.other)}`
-                    : "",
-            ].filter(Boolean),
-            [24, 24, 24, 24],
+                `{bold}Average:{/bold} ${memAvg}%`,
+                memBar,
+                `{${THEMES.muted}-fg}Trend: ${memTrend}{/${THEMES.muted}-fg}`,
+            ].join("\n"),
         );
-
-        const hotspotsLine = formatRow(
-            [
-                `{cyan-fg}CPU{/cyan-fg} ${cpuHotspot}`,
-                `{magenta-fg}MEM{/magenta-fg} ${memHotspot}`,
-                `{yellow-fg}Restarts{/yellow-fg} ${restartHotspot}`,
-            ],
-            [32, 32, 28],
-        );
-
-        const notices: string[] = [];
-        if (counters.errored > 0) {
-            notices.push(
-                `{red-fg}!{/red-fg} ${counters.errored} process${
-                    counters.errored === 1 ? "" : "es"
-                } in error state`,
-            );
-        }
-        if (counters.stopped > 0) {
-            notices.push(
-                `{yellow-fg}!{/yellow-fg} ${counters.stopped} stopped – consider cleanup or restart`,
-            );
-        }
-
-        const contentLines = [headerLine, statusLine, hotspotsLine];
-        if (notices.length > 0) {
-            for (const notice of notices) {
-                contentLines.push(formatRow([notice], [80]));
-            }
-        }
-
-        this.summaryBox.setContent(contentLines.join("\n"));
-    }
-
-    private updateActions(): void {
-        const proc = this.getSelectedProcess();
-        const mode = this.paused
-            ? "{red-fg}Paused Mode{/red-fg}"
-            : "{green-fg}Live Mode{/green-fg}";
-        const focus = proc
-            ? `{cyan-fg}${proc.name}{/cyan-fg}`
-            : "{gray-fg}No process selected{/gray-fg}";
-        const lines = [
-            mode,
-            `Focus: ${focus}`,
-            formatRow(
-                [
-                    `{green-fg}s{/green-fg} start all`,
-                    `{yellow-fg}x{/yellow-fg} stop all`,
-                ],
-                [22, 22],
-            ),
-            formatRow(
-                [
-                    `{magenta-fg}r{/magenta-fg} restart all`,
-                    `{cyan-fg}S{/cyan-fg} reload all`,
-                ],
-                [22, 22],
-            ),
-            formatRow(
-                [
-                    `{blue-fg}l{/blue-fg} clear logs`,
-                    `{white-fg}?{/white-fg} help overlay`,
-                ],
-                [22, 22],
-            ),
-            `{cyan-fg}Enter{/cyan-fg} manage selected`,
-        ];
-        this.actionsBox.setContent(lines.join("\n"));
-    }
-
-    private updateDetailPanel(): void {
-        const proc = this.getSelectedProcess();
-        if (!proc) {
-            this.detailBox.setLabel("Selected Process");
-            this.detailBox.setContent("No PM2 processes found.");
-            return;
-        }
-        this.detailBox.setLabel(
-            `Details • ${proc.name} ${proc.pmId >= 0 ? `(#${proc.pmId})` : ""}`,
-        );
-        const lines = [
-            `{bold}Status:{/bold} ${this.formatStatusBadge(proc.status)}`,
-            `{bold}Namespace:{/bold} ${proc.namespace ?? "default"}`,
-            `{bold}PID:{/bold} ${proc.pid ?? "-"}`,
-            `{bold}Exec Mode:{/bold} ${proc.execMode ?? "-"}`,
-            `{bold}Script:{/bold} ${proc.script ?? "-"}`,
-            `{bold}CPU:{/bold} ${formatCpu(proc.cpu)}`,
-            `{bold}Memory:{/bold} ${formatBytes(proc.memory)}`,
-            `{bold}Uptime:{/bold} ${formatUptime(proc.uptime)}`,
-            `{bold}Restarts:{/bold} ${proc.restarts ?? 0}`,
-        ];
-        this.detailBox.setContent(lines.join("\n"));
-    }
-
-    private updateInsights(): void {
-        const total = this.processes.length;
-        const offline = this.processes.filter(
-            (proc) => proc.status !== "online",
-        );
-        const proc = this.getSelectedProcess();
-
-        if (!proc) {
-            const message =
-                total === 0
-                    ? "No PM2 processes detected.\nUse {green-fg}pm2 start app.js{/green-fg} to bootstrap and refresh."
-                    : "Select a process to view health insights.";
-            this.insightsBox.setLabel("Insights");
-            this.insightsBox.setContent(message);
-            return;
-        }
-
-        const bullet = (color: string, text: string) =>
-            `{${color}-fg}●{/${color}-fg} ${text}`;
-
-        const lines: string[] = [];
-
-        if (proc.status === "online") {
-            lines.push(
-                bullet("green", `Running for ${formatUptime(proc.uptime)}.`),
-            );
-        } else if (proc.status === "stopped") {
-            lines.push(
-                bullet(
-                    "yellow",
-                    `Stopped. Press {cyan-fg}Enter{/cyan-fg} → Start or use {green-fg}s{/green-fg} to revive.`,
-                ),
-            );
-        } else if (proc.status === "errored") {
-            lines.push(
-                bullet(
-                    "red",
-                    "Errored state – inspect logs (press l) and consider restart.",
-                ),
-            );
-        } else {
-            lines.push(bullet("magenta", `State: ${proc.status}`));
-        }
-
-        if (proc.cpu !== undefined) {
-            if (proc.cpu >= 80) {
-                lines.push(
-                    bullet(
-                        "red",
-                        `High CPU at ${formatCpu(proc.cpu)} – investigate workload or scale.`,
-                    ),
-                );
-            } else if (proc.cpu >= 50) {
-                lines.push(
-                    bullet(
-                        "yellow",
-                        `Sustained CPU ${formatCpu(proc.cpu)} – monitor for spikes.`,
-                    ),
-                );
-            } else {
-                lines.push(
-                    bullet("gray", `CPU steady at ${formatCpu(proc.cpu)}.`),
-                );
-            }
-        } else {
-            lines.push(bullet("gray", "CPU metrics unavailable."));
-        }
-
-        if (proc.memory !== undefined) {
-            const memMb = proc.memory / (1024 * 1024);
-            if (memMb >= 700) {
-                lines.push(
-                    bullet(
-                        "red",
-                        `Memory ${memMb.toFixed(0)} MB – near 700+ MB. Check leaks or scale.`,
-                    ),
-                );
-            } else if (memMb >= 400) {
-                lines.push(
-                    bullet(
-                        "yellow",
-                        `Memory ${memMb.toFixed(0)} MB – keep an eye on growth.`,
-                    ),
-                );
-            } else {
-                lines.push(bullet("gray", `Memory ${memMb.toFixed(0)} MB.`));
-            }
-        } else {
-            lines.push(bullet("gray", "Memory metrics unavailable."));
-        }
-
-        const restarts = proc.restarts ?? 0;
-        if (restarts >= 5) {
-            lines.push(
-                bullet(
-                    "magenta",
-                    `Restarted ${restarts} times – investigate crash loop or configure backoff.`,
-                ),
-            );
-        } else if (restarts >= 1) {
-            lines.push(
-                bullet(
-                    "yellow",
-                    `Restarted ${restarts} time${restarts > 1 ? "s" : ""} since boot.`,
-                ),
-            );
-        }
-
-        const uptimeMs = proc.uptime ?? 0;
-        if (uptimeMs > 0 && uptimeMs < 5 * 60 * 1000) {
-            lines.push(
-                bullet(
-                    "cyan",
-                    "Fresh deploy (<5m uptime) – validate stability.",
-                ),
-            );
-        }
-
-        const otherOffline = offline.filter((p) => p.pmId !== proc.pmId).length;
-        if (otherOffline > 0) {
-            lines.push(
-                bullet(
-                    "yellow",
-                    `${otherOffline} other process${otherOffline === 1 ? "" : "es"} offline.`,
-                ),
-            );
-        }
-
-        if (lines.length === 0) {
-            lines.push(bullet("green", "All checks look good."));
-        }
-
-        this.insightsBox.setLabel(`Insights • ${proc.name}`);
-        this.insightsBox.setContent(lines.join("\n"));
-    }
-
-    private updateHeader(): void {
-        const modeChip = this.paused
-            ? chalk.black.bgYellow(" PAUSED ")
-            : chalk.black.bgGreen(" LIVE ");
-        const titleLine = `${chalk.black.bgCyan(" pm2x ")} ${chalk.white(
-            "Interactive PM2 Control Deck",
-        )}`;
-
-        const statsLine = formatRow(
-            [
-                `${chalk.white(this.hostname)}`,
-                `Processes ${padNumber(this.processes.length)}`,
-                `Refreshed ${chalk.gray(new Date().toLocaleTimeString())}`,
-                modeChip,
-            ],
-            [24, 18, 28, 14],
-        );
-
-        this.headerBox.setContent(`${titleLine}\n${statsLine}`);
-    }
-
-    private renderBar(value: number, max = 100, width = 20): string {
-        const clamped = Math.max(0, Math.min(value / max, 1));
-        const filled = Math.round(clamped * width);
-        const empty = Math.max(width - filled, 0);
-        return `${"#".repeat(filled)}${"-".repeat(empty)}`;
-    }
-
-    private renderMiniBar(value: number, max = 100, width = 6): string {
-        if (!Number.isFinite(value) || max <= 0) return "";
-        const clamped = Math.max(0, Math.min(value / max, 1));
-        const filled = Math.round(clamped * width);
-        const empty = Math.max(width - filled, 0);
-        return `${"=".repeat(filled)}${".".repeat(empty)}`;
     }
 
     private renderTrend(history: number[]): string {
-        if (history.length === 0) return "";
-        const chars = " .:-=+*#%@";
-        const max = 100;
+        if (history.length < 2) return "─".repeat(20);
+        const chars = " ▁▂▃▄▅▆▇█";
+        const max = Math.max(...history, 1);
         return history
-            .slice(-Math.min(history.length, 40))
+            .slice(-20)
             .map((value) => {
                 const normalized = Math.max(0, Math.min(value / max, 1));
                 const index = Math.min(
@@ -979,80 +843,492 @@ export class App {
             .join("");
     }
 
-    private openHelpOverlay(): void {
-        const box = blessed.box({
+    private updateStatsBox(
+        cpuPercent: number,
+        memPercent: number,
+        mem: any,
+    ): void {
+        const cpuBar = this.renderBar(cpuPercent, 20, THEMES.success);
+        const memBar = this.renderBar(memPercent, 20, THEMES.info);
+
+        this.statsBox.setContent(
+            [
+                `{bold}CPU:{/bold} ${cpuBar} ${cpuPercent}%`,
+                `{bold}MEM:{/bold} ${memBar} ${memPercent}%`,
+                `{${THEMES.muted}-fg}Used: ${formatBytes(mem.used)} / ${formatBytes(mem.total)}{/${THEMES.muted}-fg}`,
+            ].join("\n"),
+        );
+    }
+
+    private toggleLogsForSelected(): void {
+        const proc = this.getSelectedProcess();
+        if (proc) {
+            this.showNotification(`📝 Showing logs for: ${proc.name}`, "info");
+        }
+    }
+
+    private getSelectedProcess(): ManagedProcess | undefined {
+        const procs = this.searchQuery
+            ? this.filteredProcesses
+            : this.processes;
+        return procs[this.selectedIndex];
+    }
+
+    private async openActionMenu(): Promise<void> {
+        const proc = this.getSelectedProcess();
+        if (!proc) return;
+
+        const actions: Record<string, ActionDefinition> = {
+            "1": {
+                label: "🚀 Start",
+                handler: async (p) => this.client.startProcess(p.name),
+            },
+            "2": {
+                label: "🔄 Restart",
+                handler: async (p) => this.client.restartProcess(p.pmId),
+            },
+            "3": {
+                label: "⏹️  Stop",
+                handler: async (p) => this.client.stopProcess(p.pmId),
+                confirm: true,
+            },
+            "4": {
+                label: "♻️  Reload",
+                handler: async (p) => this.client.reloadProcess(p.pmId),
+            },
+            "5": {
+                label: "🗑️  Delete",
+                handler: async (p) => this.client.deleteProcess(p.pmId),
+                confirm: true,
+            },
+            "6": {
+                label: "📊 Show Logs",
+                handler: async (p) => {
+                    this.showNotification(`Showing logs for ${p.name}`, "info");
+                },
+            },
+        };
+
+        const menuBox = blessed.list({
             parent: this.screen,
-            width: "60%",
-            height: "70%",
             top: "center",
             left: "center",
-            label: "Keyboard Shortcuts",
-            border: "line",
-            content: `
-{bold}Navigation{/bold}
-  ↑/↓ or j/k    Move selection
-  Enter         Open action menu
-  Space         Toggle auto refresh
-
-{bold}Global Actions{/bold}
-  s             Start all processes
-  r             Restart all processes
-  x             Stop all processes
-  S             Reload all processes
-  l             Clear log viewer
-
-{bold}Misc{/bold}
-  ?             Toggle this help
-  q / Ctrl+C    Quit
-`,
+            width: "40%",
+            height: "50%",
+            label: ` ⚡ Actions for ${proc.name} `,
             tags: true,
             keys: true,
+            vi: true,
+            mouse: true,
+            border: { type: "line" },
+            style: {
+                selected: {
+                    bg: THEMES.success,
+                    fg: "black",
+                    bold: true,
+                },
+                border: { fg: THEMES.primary },
+            },
+            items: Object.values(actions).map((a) => a.label),
         });
 
-        box.focus();
-        const close = () => {
-            this.screen.remove(box);
+        menuBox.on(
+            "select",
+            async (item: Widgets.BlessedElement, index: number) => {
+                const keys = Object.keys(actions);
+                const key = keys[index];
+                if (!key) return;
+                const action = actions[key];
+                if (!action) return;
+                menuBox.destroy();
+                this.screen.render();
+
+                if (action.confirm) {
+                    const confirmed = await this.confirm(
+                        `Are you sure you want to ${action.label.replace(/[^\w\s]/gi, "")} ${proc.name}?`,
+                    );
+                    if (!confirmed) return;
+                }
+
+                await this.wrapAction(`${action.label} ${proc.name}`, () =>
+                    action.handler(proc),
+                );
+            },
+        );
+
+        menuBox.on("cancel", () => {
+            menuBox.destroy();
+            this.screen.render();
+        });
+
+        this.screen.render();
+        menuBox.focus();
+    }
+
+    private async confirm(message: string): Promise<boolean> {
+        return new Promise((resolve) => {
+            const confirmBox = blessed.box({
+                parent: this.screen,
+                top: "center",
+                left: "center",
+                width: "50%",
+                height: 7,
+                label: " ⚠️  Confirmation ",
+                tags: true,
+                keys: true,
+                border: { type: "line" },
+                style: {
+                    fg: "white",
+                    bg: "black",
+                },
+                padding: 1,
+                content: `${message}\n\nPress {green-fg}y{/green-fg} to confirm, {red-fg}n{/red-fg} to cancel`,
+            });
+
+            const cleanup = (result: boolean) => {
+                confirmBox.destroy();
+                this.screen.render();
+                resolve(result);
+            };
+
+            confirmBox.key(["y", "Y"], () => cleanup(true));
+            confirmBox.key(["n", "N", "escape", "q"], () => cleanup(false));
+            confirmBox.focus();
+            this.screen.render();
+        });
+    }
+
+    private async wrapAction(
+        description: string,
+        action: () => Promise<void>,
+    ): Promise<void> {
+        try {
+            this.showNotification(`⏳ ${description}...`, "info");
+            await action();
+            await this.refreshProcesses(true);
+            this.showNotification(`✅ ${description} completed`, "success");
+        } catch (error) {
+            this.showNotification(`❌ Failed: ${String(error)}`, "error");
+        }
+    }
+
+    private flashInfo(msg: string): void {
+        this.showNotification(msg, "info");
+    }
+
+    private flashError(msg: string): void {
+        this.showNotification(msg, "error");
+    }
+
+    private showStatusMessage(msg: string, duration = 2000): void {
+        this.showNotification(msg, "info");
+    }
+
+    private baseFooterContent(): string {
+        const spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const spinner = this.paused
+            ? "⏸️ "
+            : spinners[this.animationFrame % spinners.length];
+
+        return `${spinner} {bold}PM2X Monitor{/bold} | {${THEMES.muted}-fg}${this.hostname}{/${THEMES.muted}-fg} | 🖱️  Mouse enabled`;
+    }
+
+    private updateFooter(): void {
+        const base = this.baseFooterContent();
+        const mode = this.paused ? "{yellow-fg}PAUSED{/yellow-fg}" : "";
+        const view = this.viewMode !== "all" ? `View: ${this.viewMode}` : "";
+        const search = this.searchQuery ? `🔍 "${this.searchQuery}"` : "";
+
+        const shortcuts = [
+            "{cyan-fg}?{/cyan-fg}=Help",
+            "{cyan-fg}Click{/cyan-fg}=Select",
+            "{cyan-fg}DblClick{/cyan-fg}=Actions",
+            "{cyan-fg}Wheel{/cyan-fg}=Scroll",
+            "{cyan-fg}Space{/cyan-fg}=Pause",
+            "{cyan-fg}q{/cyan-fg}=Quit",
+        ].join(" ");
+
+        const parts = [base, mode, view, search, shortcuts]
+            .filter(Boolean)
+            .join(" | ");
+        this.footer.setContent(parts);
+    }
+
+    private changeSelection(offset: number): void {
+        const procs = this.searchQuery
+            ? this.filteredProcesses
+            : this.processes;
+        if (procs.length === 0) return;
+
+        this.selectedIndex = Math.max(
+            0,
+            Math.min(this.selectedIndex + offset, procs.length - 1),
+        );
+        this.afterSelectionChange();
+    }
+
+    private afterSelectionChange(): void {
+        const proc = this.getSelectedProcess();
+        if (proc) {
+            this.logBox.setLabel(` 📝 Live Logs • ${proc.name} `);
+            this.updateDetailPanel();
+            this.updateInsights();
+        }
+        this.screen.render();
+    }
+
+    private updateSummary(): void {
+        const total = this.processes.length;
+        const online = this.processes.filter(
+            (p) => p.status === "online",
+        ).length;
+        const stopped = this.processes.filter(
+            (p) => p.status === "stopped",
+        ).length;
+        const errored = this.processes.filter(
+            (p) => p.status === "errored",
+        ).length;
+
+        const totalCpu = this.processes.reduce(
+            (sum, p) => sum + (p.cpu || 0),
+            0,
+        );
+        const totalMem = this.processes.reduce(
+            (sum, p) => sum + (p.memory || 0),
+            0,
+        );
+
+        this.summaryBox.setContent(
+            [
+                `{bold}Total:{/bold} ${total} processes`,
+                `{${THEMES.success}-fg}● Online:{/${THEMES.success}-fg} ${online}`,
+                `{${THEMES.warning}-fg}○ Stopped:{/${THEMES.warning}-fg} ${stopped}`,
+                `{${THEMES.danger}-fg}✖ Errored:{/${THEMES.danger}-fg} ${errored}`,
+                ``,
+                `{bold}Resources:{/bold}`,
+                `CPU: ${totalCpu.toFixed(1)}%`,
+                `Memory: ${formatBytes(totalMem)}`,
+            ].join("\n"),
+        );
+    }
+
+    private updateActions(): void {
+        const proc = this.getSelectedProcess();
+        const selected = proc
+            ? `{${THEMES.accent}-fg}${proc.name}{/${THEMES.accent}-fg}`
+            : "{${THEMES.muted}-fg}none{/${THEMES.muted}-fg}";
+
+        this.actionsBox.setContent(
+            [
+                `{bold}Selected:{/bold} ${selected}`,
+                ``,
+                `{${THEMES.success}-fg}s{/${THEMES.success}-fg} Start all`,
+                `{${THEMES.info}-fg}r{/${THEMES.info}-fg} Restart all`,
+                `{${THEMES.warning}-fg}x{/${THEMES.warning}-fg} Stop all`,
+                `{${THEMES.primary}-fg}S{/${THEMES.primary}-fg} Reload all`,
+                `{${THEMES.danger}-fg}d{/${THEMES.danger}-fg} Delete all`,
+                ``,
+                `{${THEMES.accent}-fg}Enter{/${THEMES.accent}-fg} Process menu`,
+            ].join("\n"),
+        );
+    }
+
+    private updateDetailPanel(): void {
+        const proc = this.getSelectedProcess();
+        if (!proc) {
+            this.detailBox.setContent("{center}No process selected{/center}");
+            return;
+        }
+
+        const status = this.formatStatusBadge(proc.status);
+        const cpuColor = (proc.cpu || 0) > 50 ? THEMES.danger : THEMES.success;
+        const memMb = (proc.memory || 0) / (1024 * 1024);
+        const memColor = memMb > 500 ? THEMES.danger : THEMES.info;
+
+        this.detailBox.setContent(
+            [
+                `{bold}Name:{/bold} ${proc.name}`,
+                `{bold}Status:{/bold} ${status}`,
+                `{bold}PID:{/bold} ${proc.pid || "-"}`,
+                `{bold}PM ID:{/bold} ${proc.pmId}`,
+                `{bold}Namespace:{/bold} ${proc.namespace || "default"}`,
+                ``,
+                `{bold}CPU:{/bold} {${cpuColor}-fg}${formatCpu(proc.cpu)}{/${cpuColor}-fg}`,
+                `{bold}Memory:{/bold} {${memColor}-fg}${formatBytes(proc.memory)}{/${memColor}-fg}`,
+                `{bold}Uptime:{/bold} ${formatUptime(proc.uptime)}`,
+                `{bold}Restarts:{/bold} ${proc.restarts || 0}`,
+            ].join("\n"),
+        );
+    }
+
+    private updateInsights(): void {
+        const proc = this.getSelectedProcess();
+        if (!proc) {
+            this.insightsBox.setContent("{center}Select a process{/center}");
+            return;
+        }
+
+        const insights: string[] = [];
+
+        // CPU insights
+        if ((proc.cpu || 0) > 80) {
+            insights.push(
+                `{${THEMES.danger}-fg}⚠{/${THEMES.danger}-fg} High CPU usage`,
+            );
+        } else if ((proc.cpu || 0) > 50) {
+            insights.push(
+                `{${THEMES.warning}-fg}⚠{/${THEMES.warning}-fg} Elevated CPU`,
+            );
+        }
+
+        // Memory insights
+        const memMb = (proc.memory || 0) / (1024 * 1024);
+        if (memMb > 700) {
+            insights.push(
+                `{${THEMES.danger}-fg}⚠{/${THEMES.danger}-fg} High memory usage`,
+            );
+        } else if (memMb > 400) {
+            insights.push(
+                `{${THEMES.warning}-fg}⚠{/${THEMES.warning}-fg} Elevated memory`,
+            );
+        }
+
+        // Restart insights
+        if ((proc.restarts || 0) > 5) {
+            insights.push(
+                `{${THEMES.danger}-fg}⚠{/${THEMES.danger}-fg} Frequent restarts`,
+            );
+        }
+
+        // Status insights
+        if (proc.status === "errored") {
+            insights.push(
+                `{${THEMES.danger}-fg}✖{/${THEMES.danger}-fg} Process in error state`,
+            );
+        } else if (proc.status === "stopped") {
+            insights.push(
+                `{${THEMES.warning}-fg}○{/${THEMES.warning}-fg} Process is stopped`,
+            );
+        }
+
+        if (insights.length === 0) {
+            insights.push(
+                `{${THEMES.success}-fg}✓{/${THEMES.success}-fg} All checks passed`,
+            );
+        }
+
+        this.insightsBox.setContent(insights.join("\n"));
+    }
+
+    private updateHeader(): void {
+        const now = new Date().toLocaleTimeString();
+        const status = this.paused
+            ? `{${THEMES.warning}-bg}{black-fg} PAUSED {/black-fg}{/${THEMES.warning}-bg}`
+            : `{${THEMES.success}-bg}{black-fg} LIVE {/black-fg}{/${THEMES.success}-bg}`;
+
+        this.headerBox.setContent(
+            `{center}{bold}🚀 PM2X • Interactive Process Manager{/bold}\n{${THEMES.muted}-fg}Host: ${this.hostname} | Time: ${now} | ${status}{/${THEMES.muted}-fg}{/center}`,
+        );
+    }
+
+    private renderBar(
+        percent: number,
+        width = 20,
+        color = THEMES.primary,
+    ): string {
+        const filled = Math.round((percent / 100) * width);
+        const empty = width - filled;
+        const bar = "█".repeat(filled) + "░".repeat(empty);
+        return `{${color}-fg}${bar}{/${color}-fg}`;
+    }
+
+    private openHelpOverlay(): void {
+        const helpBox = blessed.box({
+            parent: this.screen,
+            top: "center",
+            left: "center",
+            width: "70%",
+            height: "80%",
+            label: " 📚 Help & Keyboard Shortcuts ",
+            tags: true,
+            keys: true,
+            vi: true,
+            mouse: true,
+            scrollable: true,
+            border: { type: "line" },
+            style: {
+                fg: "white",
+                bg: "black",
+                border: { fg: THEMES.primary },
+                label: { fg: THEMES.accent, bold: true },
+            },
+            padding: 1,
+        });
+
+        helpBox.setContent(
+            [
+                "{bold}{center}PM2X Interactive Monitor{/center}{/bold}",
+                "",
+                "{bold}Navigation:{/bold}",
+                "  {cyan-fg}↑/↓{/cyan-fg} or {cyan-fg}j/k{/cyan-fg}  Move selection up/down",
+                "  {cyan-fg}g{/cyan-fg}              Jump to first process",
+                "  {cyan-fg}G{/cyan-fg}              Jump to last process",
+                "  {cyan-fg}PageUp/Down{/cyan-fg}    Scroll by 10 items",
+                "",
+                "{bold}Mouse Controls:{/bold}",
+                "  {cyan-fg}Click{/cyan-fg}          Select process and focus panel",
+                "  {cyan-fg}Double Click{/cyan-fg}   Open action menu for process",
+                "  {cyan-fg}Scroll Wheel{/cyan-fg}   Navigate through processes/logs",
+                "  {cyan-fg}Drag{/cyan-fg}           Scroll through content",
+                "",
+                "{bold}Process Actions:{/bold}",
+                "  {cyan-fg}Enter{/cyan-fg} or {cyan-fg}a{/cyan-fg}    Open action menu for selected process",
+                "  {cyan-fg}s{/cyan-fg}              Start all processes",
+                "  {cyan-fg}r{/cyan-fg}              Restart all processes",
+                "  {cyan-fg}x{/cyan-fg}              Stop all processes",
+                "  {cyan-fg}S{/cyan-fg}              Reload all processes",
+                "  {cyan-fg}d{/cyan-fg}              Delete all processes",
+                "",
+                "{bold}View Modes:{/bold}",
+                "  {cyan-fg}1{/cyan-fg}              Show all processes",
+                "  {cyan-fg}2{/cyan-fg}              Show only running processes",
+                "  {cyan-fg}3{/cyan-fg}              Show only stopped processes",
+                "",
+                "{bold}Search & Filter:{/bold}",
+                "  {cyan-fg}/{/cyan-fg}              Start search",
+                "  {cyan-fg}Escape{/cyan-fg}         Cancel search",
+                "",
+                "{bold}Controls:{/bold}",
+                "  {cyan-fg}Space{/cyan-fg}          Pause/Resume auto-refresh",
+                "  {cyan-fg}F5{/cyan-fg} or {cyan-fg}R{/cyan-fg}      Force refresh",
+                "  {cyan-fg}l{/cyan-fg}              Focus logs on selected process",
+                "  {cyan-fg}?{/cyan-fg} or {cyan-fg}h{/cyan-fg}      Show this help",
+                "  {cyan-fg}q{/cyan-fg} or {cyan-fg}Ctrl+C{/cyan-fg}  Quit application",
+                "",
+                "{bold}Tips:{/bold}",
+                "  • Use arrow keys or vim-style navigation (j/k)",
+                "  • Press Enter on a process to see available actions",
+                "  • Monitor updates automatically every 2 seconds",
+                "  • Charts show last 60 seconds of system metrics",
+                "  • Use search (/) to quickly find processes",
+                "",
+                "{center}{grey-fg}Press any key to close this help{/grey-fg}{/center}",
+            ].join("\n"),
+        );
+
+        helpBox.key(["escape", "q", "enter", "?", "h"], () => {
+            helpBox.destroy();
             this.processTable.focus();
             this.screen.render();
-        };
-        box.key(["escape", "q", "enter"], close);
+        });
+
         this.screen.render();
+        helpBox.focus();
     }
 }
 
+// Helper functions
 function getColor(color: string): (value: string) => string {
     const map = chalk as unknown as Record<string, (value: string) => string>;
     return map[color] ?? ((value: string) => value);
-}
-
-const ANSI_REGEX = /\x1B\[[0-9;]*m/g;
-const TAG_REGEX = /\{\/?[a-z0-9#-]+\}/gi;
-
-function stripMarkup(value: string): string {
-    return value.replace(ANSI_REGEX, "").replace(TAG_REGEX, "");
-}
-
-function padMarkup(value: string, width: number): string {
-    if (width <= 0) return value;
-    const visible = stripMarkup(value);
-    const pad = Math.max(width - visible.length, 0);
-    return `${value}${" ".repeat(pad)}`;
-}
-
-function formatRow(
-    cells: string[],
-    widths: number[],
-    separator = "  ",
-): string {
-    return cells
-        .map((cell, index) => {
-            const width = widths[Math.min(index, widths.length - 1)] ?? 0;
-            return padMarkup(cell, width);
-        })
-        .join(separator)
-        .trimEnd();
-}
-
-function padNumber(value: number, width = 2): string {
-    return String(value).padStart(width, " ");
 }

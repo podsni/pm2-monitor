@@ -1,20 +1,71 @@
 {
-  "name": "pm2monitor",
-  "module": "index.ts",
-  "type": "module",
-  "private": true,
-  "devDependencies": {
-    "@types/blessed": "^0.1.25",
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  },
-  "dependencies": {
-    "blessed": "^0.1.81",
-    "blessed-contrib": "^4.11.0",
-    "chalk": "^5.6.2",
-    "pm2": "^6.0.13",
-    "systeminformation": "^5.27.11"
-  }
+    "name": "pm2x-monitor",
+    "version": "1.0.0",
+    "description": "Interactive PM2 process monitor with real-time metrics and beautiful TUI",
+    "main": "index.ts",
+    "module": "index.ts",
+    "type": "module",
+    "private": false,
+    "scripts": {
+        "start": "bun run index.ts",
+        "dev": "bun run --watch index.ts",
+        "build": "./build.sh",
+        "build:linux": "./build.sh linux-x64",
+        "build:linux-arm": "./build.sh linux-arm64",
+        "build:windows": "./build.sh windows-x64",
+        "build:macos": "./build.sh macos-x64",
+        "build:macos-arm": "./build.sh macos-arm64",
+        "build:all": "./build.sh",
+        "test": "bun test",
+        "fmt": "bun fmt",
+        "clean": "rm -rf dist node_modules bun.lock"
+    },
+    "keywords": [
+        "pm2",
+        "monitor",
+        "process",
+        "tui",
+        "terminal",
+        "interactive",
+        "bun",
+        "pm2-monitor",
+        "process-manager",
+        "cli"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/yourusername/pm2x-monitor.git"
+    },
+    "bugs": {
+        "url": "https://github.com/yourusername/pm2x-monitor/issues"
+    },
+    "homepage": "https://github.com/yourusername/pm2x-monitor#readme",
+    "author": "Your Name <your.email@example.com>",
+    "license": "MIT",
+    "engines": {
+        "node": ">=18.0.0",
+        "bun": ">=1.0.0"
+    },
+    "devDependencies": {
+        "@types/blessed": "^0.1.25",
+        "@types/bun": "latest",
+        "@types/node": "^20.0.0"
+    },
+    "peerDependencies": {
+        "typescript": "^5"
+    },
+    "dependencies": {
+        "blessed": "^0.1.81",
+        "blessed-contrib": "^4.11.0",
+        "chalk": "^5.6.2",
+        "pm2": "^6.0.13",
+        "systeminformation": "^5.27.11"
+    },
+    "bundledDependencies": [
+        "blessed",
+        "blessed-contrib",
+        "chalk",
+        "pm2",
+        "systeminformation"
+    ]
 }
